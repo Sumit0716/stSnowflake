@@ -4,3 +4,4 @@ pandas
 python-dotenv
 snowflake-snowpark-python
 snowflake-connector-python
+plotly>=5.0.0
