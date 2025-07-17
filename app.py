@@ -1,188 +1,192 @@
 import streamlit as st
-from snowflake.snowpark import Session
-from snowflake.snowpark.exceptions import SnowparkSQLException
 import pandas as pd
-import plotly.graph_objects as go
-from typing import List
 from io import BytesIO
+from dotenv import load_dotenv
+import os
+from sqlalchemy import create_engine
+from field_dictionary import FIELD_DICT
 
-# ----------------------- CONFIG -----------------------
+# Load environment variables
+load_dotenv()
 
-# Load Snowflake connection info securely from Streamlit secrets
-connection_parameters = {
-    "account": st.secrets["SNOWFLAKE_ACCOUNT"],
-    "user": st.secrets["SNOWFLAKE_USER"],
-    "password": st.secrets["SNOWFLAKE_PASSWORD"],
-    "role": st.secrets["SNOWFLAKE_ROLE"],
-    "warehouse": st.secrets["SNOWFLAKE_WAREHOUSE"],
-    "database": st.secrets["SNOWFLAKE_DATABASE"],
-    "schema": st.secrets["SNOWFLAKE_SCHEMA"]
-}
+user = os.getenv("SNOWFLAKE_USER")
+password = os.getenv("SNOWFLAKE_PASSWORD")
+account = os.getenv("SNOWFLAKE_ACCOUNT")
+warehouse = os.getenv("SNOWFLAKE_WAREHOUSE")
+role = os.getenv("SNOWFLAKE_ROLE")
+database = os.getenv("SNOWFLAKE_DATABASE")
+schema = os.getenv("SNOWFLAKE_SCHEMA")
 
-# Create Snowflake session
-@st.cache_resource(show_spinner=False)
-def get_session() -> Session:
-    return Session.builder.configs(connection_parameters).create()
+# Set wide layout
+st.set_page_config(layout="wide")
 
-session = get_session()
+# Apply custom CSS for tighter layout and styled download button
+st.markdown("""
+    <style>
+        /* Main container padding */
+        .main .block-container {
+            padding-top: 1rem;
+            padding-left: 2rem;
+            padding-right: 2rem;
+        }
 
-# ----------------------- ROLES -----------------------
+        /* Sidebar width customization */
+        section[data-testid="stSidebar"] > div:first-child {
+            width: 300px;  /* Increase this value as needed */
+        }
 
-@st.cache_data(ttl=300)
-def list_roles() -> List[str]:
-    """List roles available to the current user"""
-    rows = session.sql("SHOW ROLES").collect()
-    return [row["name"] for row in rows]
+        /* Download button styling */
+        .download-container {
+            display: flex;
+            justify-content: flex-end;
+            margin-bottom: 1rem;
+        }
 
-roles = list_roles()
-selected_role = st.sidebar.selectbox("Select Role", roles, index=roles.index(connection_parameters["role"]))
+        .download-btn {
+            background-color: white;
+            color: #262730;
+            border: 1px solid #d3d3d3;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-weight: 500;
+            font-size: 14px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-@st.cache_resource
-def get_session_for_role(role: str) -> Session:
-    """Create a new session for the selected role"""
-    new_params = connection_parameters.copy()
-    new_params["role"] = role
-    return Session.builder.configs(new_params).create()
+# Snowflake connection engine
+engine = create_engine(
+    f"snowflake://{user}:{password}@{account}/{database}/{schema}?warehouse={warehouse}&role={role}"
+)
 
-session = get_session_for_role(selected_role)
+table_name = 'DB_DEMO_DBT.PUBLIC.TARA_BASE_LAYER'
 
-# ----------------------- TABLE LISTING -----------------------
+# App Title
+st.markdown("## 📈 TARA Reports")
+st.markdown("Use filters on the left to generate insights and download the report.")
 
-@st.cache_data(ttl=600, show_spinner=False)
-def list_tables(_session) -> List[str]:
-    """List fully qualified table names (DB.SCHEMA.TABLE) visible to current role"""
-    q = _session.sql("""
-        SELECT table_catalog || '.' || table_schema || '.' || table_name AS fq
-        FROM information_schema.tables
-        WHERE table_type = 'BASE TABLE'
-        ORDER BY 1
-    """)
-    return [r[0] for r in q.collect()]
+# Sidebar - Configuration
+st.sidebar.title("⚙️ Report Configuration")
+report_type = st.sidebar.selectbox("📄 Report Template", ["Offer Accepts", "Adhoc Request"])
 
-all_tables = list_tables(session)
+# Static Filters Section
+st.sidebar.markdown("### 🔍 Basic Filters")
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_table(table_fq: str) -> pd.DataFrame:
-    """Load Snowflake table to Pandas and uppercase column names"""
-    df = session.table(table_fq).to_pandas()
-    df.columns = [c.upper() for c in df.columns]
-    return df
+# Reporting Org Filter
+ro_df = pd.read_sql(f"SELECT DISTINCT TARA_REPORTING_ORG FROM {table_name}", engine)
+ro_options = sorted(ro_df.iloc[:, 0].dropna().unique().tolist())
+selected_ro = st.sidebar.multiselect("Reporting Org(s)", options=ro_options)
 
-# ----------------------- UI -----------------------
+# Gender Filter
+gender_df = pd.read_sql(f"SELECT DISTINCT TARA_GENDER FROM {table_name}", engine)
+gender_options = sorted(gender_df.iloc[:, 0].dropna().unique().tolist())
+selected_gender = st.sidebar.multiselect("Gender(s)", options=gender_options)
 
-st.set_page_config(page_title="Snowflake Explorer", layout="wide")
-st.title("📊 Snowflake Explorer")
-
-if not all_tables:
-    st.error("No tables accessible to the current role.")
-    st.stop()
-
-# Table selection
-table_fq = st.selectbox("Select a table", all_tables)
-df = load_table(table_fq)
-
-# Dimension and metric column selection
-all_cols = df.columns.tolist()
-with st.sidebar:
-    st.header("Configure View")
-    dims = st.multiselect("Dimension columns (categorical)", options=all_cols, default=[all_cols[0]])
-    metrics = st.multiselect(
-        "Metric columns (numeric)",
-        options=[c for c in all_cols if pd.api.types.is_numeric_dtype(df[c])],
-        default=[c for c in all_cols if pd.api.types.is_numeric_dtype(df[c])][:1]
+# Year Filter for Offer Accepts
+selected_years = None
+if report_type == "Offer Accepts":
+    year_df = pd.read_sql(
+        f"SELECT DISTINCT YEAR(CAN_OFFER_ACCEPT_DATE) AS offer_year FROM {table_name} WHERE CAN_OFFER_ACCEPT_DATE IS NOT NULL",
+        engine
     )
+    year_options = sorted(year_df['offer_year'].dropna().astype(int).unique().tolist())
+    selected_years = st.sidebar.multiselect("Offer Accept Year(s)", options=year_options)
 
-    # Null / Not Null filter per dimension
-    st.markdown("---")
-    st.subheader("Apply Filters")
-    filters = {}
-    for col in dims:
-        filter_choice = st.radio(
-            f"{col} filter:", 
-            options=["All", "Not Null", "Null"], 
-            index=1, 
-            horizontal=True, 
-            key=f"null_filter_{col}"
-        )
-        filters[col] = filter_choice
+# Validation
+filters_ready = selected_ro and selected_gender
+if report_type == "Offer Accepts":
+    filters_ready = filters_ready and selected_years
 
-# ----------------------- FILTERING -----------------------
+# Query based on filters
+df = pd.DataFrame()
+if filters_ready:
+    ro_str = ', '.join(f"'{ro}'" for ro in selected_ro)
+    gender_str = ', '.join(f"'{g}'" for g in selected_gender)
 
-# ----------------------- FILTERING -----------------------
-
-mask = pd.Series(True, index=df.index)
-for col, choice in filters.items():
-    if choice == "Not Null":
-        mask &= df[col].notnull()
-    elif choice == "Null":
-        mask &= df[col].isnull()
-filtered_df = df[mask]
-
-# ✅ Show updated record count
-st.success(f"🔢 {len(filtered_df):,} record(s) match the current filters.")
-
-st.subheader("📄 Data Preview")
-st.dataframe(filtered_df, height=400, use_container_width=True)
-
-# ----------------------- SANKEY CHART -----------------------
-
-if len(dims) >= 2 and metrics:
-    st.subheader("🔀 Sankey Chart")
-    dim1, dim2 = dims[:2]
-    metric = metrics[0]
-
-    sankey_df = (
-        filtered_df[[dim1, dim2, metric]]
-        .groupby([dim1, dim2], as_index=False)[metric]
-        .sum()
-    )
-
-    if not sankey_df.empty:
-        labels = list(pd.concat([sankey_df[dim1], sankey_df[dim2]]).unique())
-        label_index = {l: i for i, l in enumerate(labels)}
-
-        fig = go.Figure(data=[go.Sankey(
-            node=dict(label=labels, pad=15, thickness=20, line=dict(color="black", width=0.5)),
-            link=dict(
-                source=[label_index[r] for r in sankey_df[dim1]],
-                target=[label_index[t] for t in sankey_df[dim2]],
-                value=sankey_df[metric]
-            )
-        )])
-        st.plotly_chart(fig, use_container_width=True)
+    if report_type == "Offer Accepts":
+        year_str = ', '.join(str(y) for y in selected_years)
+        query = f"""
+        SELECT
+            CAN_APPLICATION_ID,
+            CAN_ATS_ID,
+            CAN_CONFIDENTIAL_INDICATOR,
+            CAN_CURRENT_STAGE,
+            CAN_GPA,
+            CAN_CURRENT_STAGE TS,
+            WD_POSITION_ID,
+            CAN_JOB_CREATED_DATE,
+            CAN_JOB_APP_SUB_TIME,
+            CAN_OFFER_ACCEPT_DATE,
+            YEAR(CAN_OFFER_ACCEPT_DATE) AS CAN_OFFER_ACCEPT_YEAR,
+            CAN_EXPECTED_START_DATE,
+            YEAR(CAN_EXPECTED_START_DATE) AS CAN_EXPECTED_START_YEAR,
+            CAN_JOB_RECRUITER_EXTERNAL_ID,
+            TARA_REPORTING_ORG,
+            CAN_JOB_RECORD_FOLDER,
+            TARA_GENDER
+        FROM {table_name}
+        WHERE TARA_REPORTING_ORG IN ({ro_str})
+        AND TARA_GENDER IN ({gender_str})
+        AND YEAR(CAN_OFFER_ACCEPT_DATE) IN ({year_str})
+        """
     else:
-        st.info("No data available for Sankey chart with current filters.")
+        query = f"""
+        SELECT *
+        FROM {table_name}
+        WHERE TARA_REPORTING_ORG IN ({ro_str})
+        AND TARA_GENDER IN ({gender_str})
+        """
+    df = pd.read_sql(query, engine)
 
-# ----------------------- SQL DISPLAY -----------------------
+# Dynamic Filters in Sidebar (Advanced)
+filtered_df = df.copy()
+if not df.empty:
+    with st.sidebar.expander("⚙️ Advanced View Filters"):
+        all_cols = df.columns.tolist()
+        all_cols_upper_sorted = sorted([col.upper() for col in all_cols])
+        extra_cols = st.multiselect("Other Fields", options=all_cols_upper_sorted)
 
-st.subheader("🧾 Generated SQL")
-sql_conditions = []
-for col, choice in filters.items():
-    if choice == "Not Null":
-        sql_conditions.append(f"{col} IS NOT NULL")
-    elif choice == "Null":
-        sql_conditions.append(f"{col} IS NULL")
-sql_preview = f"SELECT * FROM {table_fq}"
-if sql_conditions:
-    sql_preview += " WHERE " + " AND ".join(sql_conditions)
-st.code(sql_preview)
+        for col in extra_cols:
+            original_col = next((c for c in all_cols if c.upper() == col), col)
+            unique_vals = df[original_col].dropna().unique().tolist()
 
-# ----------------------- DOWNLOAD -----------------------
+            if len(unique_vals) > 100:
+                selected_option = st.selectbox(
+                    f"{original_col} (High Cardinality)", ["All", "Only Non-Null", "Only Null"], key=f"hc_{col}"
+                )
+                if selected_option == "Only Null":
+                    filtered_df = filtered_df[filtered_df[original_col].isna()]
+                elif selected_option == "Only Non-Null":
+                    filtered_df = filtered_df[filtered_df[original_col].notna()]
+            else:
+                selected_vals = st.multiselect(
+                    f"{original_col}", options=sorted(unique_vals), default=unique_vals, key=f"multi_{col}"
+                )
+                filtered_df = filtered_df[filtered_df[original_col].isin(selected_vals)]
 
-st.subheader("⬇️ Download Filtered Data")
-file_format = st.radio("Select file format:", ["CSV", "Excel"], horizontal=True)
+# Result Section
+st.markdown("---")
+if not filtered_df.empty:
+    st.subheader(f"📊 Filtered Data Preview ({len(filtered_df)} rows)")
+    st.dataframe(filtered_df.head(10), use_container_width=True)
 
-if file_format == "CSV":
-    csv = filtered_df.to_csv(index=False)
-    st.download_button("Download CSV", data=csv, file_name="filtered_data.csv", mime="text/csv")
+    # Download Area
+    csv_data = filtered_df.to_csv(index=False)
+
+    with st.expander("📥 Download Options", expanded=True):
+        st.download_button(
+            label="⬇️ Download CSV",
+            data=csv_data,
+            file_name="filtered_data.csv",
+            mime="text/csv",
+            key="download_csv_top"
+        )
+
+elif filters_ready:
+    st.warning("⚠️ No data found for the selected filters.")
 else:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        filtered_df.to_excel(writer, index=False, sheet_name="Data")
-    output.seek(0)
-    st.download_button(
-        "Download Excel",
-        data=output,
-        file_name="filtered_data.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    st.info("✅ Please complete all required filters to view data.")
