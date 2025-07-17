@@ -1,8 +1,12 @@
 streamlit==1.46.0
-snowflake-connector-python==3.16.0
 pandas
-python-dotenv
-snowflake-snowpark-python
-snowflake-connector-python
 plotly>=5.0.0
+python-dotenv
+
+# Snowflake + Snowpark
+snowflake-connector-python==3.16.0
+snowflake-snowpark-python
+snowflake-sqlalchemy
+
+# SQLAlchemy for database connections
 sqlalchemy>=1.4,<2.0
