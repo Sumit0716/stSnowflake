@@ -77,7 +77,8 @@ report_type = st.sidebar.selectbox("📄 Report Template", ["Offer Accepts", "Ad
 st.sidebar.markdown("### 🔍 Basic Filters")
 
 # Reporting Org Filter
-ro_df = pd.read_sql(f"SELECT DISTINCT TARA_REPORTING_ORG FROM {table_name}", engine)
+with engine.connect() as conn:
+    ro_df = pd.read_sql(f"SELECT DISTINCT TARA_REPORTING_ORG FROM {table_name}", conn)
 ro_options = sorted(ro_df.iloc[:, 0].dropna().unique().tolist())
 selected_ro = st.sidebar.multiselect("Reporting Org(s)", options=ro_options)
 
